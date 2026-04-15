@@ -1,0 +1,122 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REGISTRY: 791342033319.dkr.ecr.us-west-2.amazonaws.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push images
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build website
+          cp -r html/ nginx/html/
+          docker build -t $ECR_REGISTRY/website-nginx:$IMAGE_TAG ./nginx
+          docker push $ECR_REGISTRY/website-nginx:$IMAGE_TAG
+
+          # Build proxy
+          docker build -t $ECR_REGISTRY/proxy-nginx:$IMAGE_TAG ./proxy
+          docker push $ECR_REGISTRY/proxy-nginx:$IMAGE_TAG
+
+      - name: Deploy to EC2 via SSM
+        id: ssm-deploy
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          WEBSITE_IMAGE="$ECR_REGISTRY/website-nginx:$IMAGE_TAG"
+          PROXY_IMAGE="$ECR_REGISTRY/proxy-nginx:$IMAGE_TAG"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 300 \
+            --parameters commands='[
+              "set -e",
+              "aws ecr get-login-password --region '"${{ env.AWS_REGION }}"' | docker login --username AWS --password-stdin '"$ECR_REGISTRY"'",
+              "docker pull '"$WEBSITE_IMAGE"'",
+              "docker pull '"$PROXY_IMAGE"'",
+              "docker network create web 2>/dev/null || true",
+              "docker stop website-nginx 2>/dev/null && docker rm website-nginx 2>/dev/null || true",
+              "docker run -d --name website-nginx --restart unless-stopped --network web -p 127.0.0.1:8081:80 '"$WEBSITE_IMAGE"'",
+              "docker stop proxy-nginx 2>/dev/null && docker rm proxy-nginx 2>/dev/null || true",
+              "docker run -d --name proxy-nginx --restart unless-stopped --network host -v /etc/letsencrypt:/etc/letsencrypt:ro -v /var/www/certbot:/var/www/certbot:ro '"$PROXY_IMAGE"'",
+              "sleep 2",
+              "curl -sf -k https://localhost/ || echo Warning: health check failed"
+            ]' \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment to complete
+        env:
+          COMMAND_ID: ${{ steps.ssm-deploy.outputs.command_id }}
+        run: |
+          echo "Waiting for SSM command $COMMAND_ID..."
+
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            case "$STATUS" in
+              Success)
+                echo "Deployment succeeded"
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                exit 0
+                ;;
+              Failed|TimedOut|Cancelled)
+                echo "Deployment failed with status: $STATUS"
+                echo "--- STDOUT ---"
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                echo "--- STDERR ---"
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+                  --query 'StandardErrorContent' \
+                  --output text
+                exit 1
+                ;;
+              *)
+                sleep 5
+                ;;
+            esac
+          done
+
+          echo "Timed out waiting for SSM command"
+          exit 1
